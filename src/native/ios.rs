@@ -54,9 +54,26 @@ impl crate::native::NativeDisplay for IosDisplay {
     fn set_window_size(&mut self, _new_width: u32, _new_height: u32) {}
     fn set_fullscreen(&mut self, _fullscreen: bool) {}
     fn clipboard_get(&mut self) -> Option<String> {
-        None
+        unsafe {
+            let pasteboard: ObjcId = msg_send![class!(UIPasteboard), generalPasteboard];
+            let string: ObjcId = msg_send![pasteboard, string];
+            if string.is_null() {
+                return None;
+            }
+            let ptr: *const std::os::raw::c_char = msg_send![string, UTF8String];
+            if ptr.is_null() {
+                return None;
+            }
+            Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
     }
-    fn clipboard_set(&mut self, _data: &str) {}
+    fn clipboard_set(&mut self, data: &str) {
+        unsafe {
+            let pasteboard: ObjcId = msg_send![class!(UIPasteboard), generalPasteboard];
+            let string = apple_util::str_to_nsstring(data);
+            let _: () = msg_send![pasteboard, setString: string];
+        }
+    }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -346,6 +363,13 @@ pub fn define_app_delegate() -> *const Class {
     }
 
     extern "C" fn applicationDidBecomeActive(this: &Object, _: Sel, _: ObjcId) {
+        unsafe {
+            let controller = *VIEW_CTRL_OBJ.lock().unwrap() as ObjcId;
+            if !controller.is_null() {
+                let _: () = msg_send![controller, setPreferredFramesPerSecond: 120];
+                let _: () = msg_send![controller, setPaused: NO];
+            }
+        }
         if let Some(func) = *PAUSE_RESUME_LISTENER.lock().unwrap() {
             func(false);
         }

@@ -505,6 +505,16 @@ gl_loader!(
         height: GLsizei,
         border: GLint
     ) -> (),
+    fn glCopyTexSubImage2D(
+        target: GLenum,
+        level: GLint,
+        xoffset: GLint,
+        yoffset: GLint,
+        x: GLint,
+        y: GLint,
+        width: GLsizei,
+        height: GLsizei
+    ) -> (),
     fn glClearDepthf(d: GLfloat) -> (),
     fn glClearDepth(depth: GLclampd) -> (),
     fn glFramebufferTexture2D(
