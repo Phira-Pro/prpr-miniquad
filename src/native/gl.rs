@@ -325,11 +325,26 @@ macro_rules! gl_loader {
                 }
             )*
         }
+
+        /// Whether the active loader supplied a usable entry, without calling it.
+        /// Reject WGL's invalid non-null sentinel addresses as well as missing entries.
+        pub fn is_function_loaded(name: &str) -> bool {
+            unsafe {
+                match name {
+                    $(stringify!($fn) => __pfns::$fn.map_or(false, |pointer| {
+                        let address = pointer as usize;
+                        address > 3 && address != usize::MAX
+                    }),)*
+                    _ => false,
+                }
+            }
+        }
     };
 }
 
 gl_loader!(
     fn glGetString(name: GLenum) -> *const GLubyte,
+    fn glGetFramebufferAttachmentParameteriv(target: GLenum, attachment: GLenum, pname: GLenum, params: *mut GLint) -> (),
     fn glFramebufferTextureLayer(
         target: GLenum,
         attachment: GLenum,

@@ -1,6 +1,7 @@
 use std::{ffi::CString, mem};
 
 mod texture;
+mod capabilities;
 
 use crate::{native::gl::*, Context};
 
@@ -667,6 +668,7 @@ pub struct GraphicsContext {
     pipelines: Vec<PipelineInternal>,
     passes: Vec<RenderPassInternal>,
     default_framebuffer: GLuint,
+    framebuffer_blit: bool,
     cache: GlCache,
 
     pub(crate) features: Features,
@@ -687,6 +689,7 @@ impl GraphicsContext {
             glBindVertexArray(vao);
             GraphicsContext {
                 default_framebuffer,
+                framebuffer_blit: capabilities::framebuffer_blit(),
                 shaders: vec![],
                 pipelines: vec![],
                 passes: vec![],
@@ -715,6 +718,12 @@ impl GraphicsContext {
 
     pub fn features(&self) -> &Features {
         &self.features
+    }
+
+    /// Current-context API/entry support. Each copy must still validate its
+    /// framebuffer completeness, sample counts and color conversion conditions.
+    pub fn supports_framebuffer_blit(&self) -> bool {
+        self.framebuffer_blit
     }
 }
 
@@ -904,6 +913,15 @@ impl GraphicsContext {
     }
 
     pub fn apply_bindings(&mut self, bindings: &Bindings) {
+        self.apply_bindings_with_offsets(bindings, &[]);
+    }
+
+    /// Apply bindings with a byte offset for each vertex buffer.
+    ///
+    /// Missing offsets default to zero. Indices remain local to each vertex
+    /// slice, so a shared buffer may contain more than 65536 vertices while
+    /// individual draws still use u16 indices. This also works on GLES2.
+    pub fn apply_bindings_with_offsets(&mut self, bindings: &Bindings, vertex_offsets: &[usize]) {
         let pip = &self.pipelines[self.cache.cur_pipeline.unwrap().0];
         let shader = &self.shaders[pip.shader.0];
 
@@ -933,8 +951,13 @@ impl GraphicsContext {
 
             let pip_attribute = pip.layout.get(attr_index).copied();
 
-            if let Some(Some(attribute)) = pip_attribute {
+            if let Some(Some(mut attribute)) = pip_attribute {
                 let vb = bindings.vertex_buffers[attribute.buffer_index];
+                let offset = vertex_offsets.get(attribute.buffer_index).copied().unwrap_or(0);
+                assert!(offset <= vb.size, "Vertex buffer offset is out of bounds");
+                attribute.offset = attribute.offset.checked_add(
+                    <i64 as std::convert::TryFrom<usize>>::try_from(offset).expect("Vertex buffer offset is too large")
+                ).expect("Vertex attribute offset overflow");
 
                 if cached_attr.map_or(true, |cached_attr| {
                     attribute != cached_attr.attribute || cached_attr.gl_vbuf != vb.gl_buf
@@ -1077,7 +1100,21 @@ impl GraphicsContext {
 
     /// start rendering to an offscreen framebuffer
     pub fn begin_pass(&mut self, pass: impl Into<Option<RenderPass>>, action: PassAction) {
-        let (framebuffer, w, h) = match pass.into() {
+        self.begin_pass_inner(pass.into(), action, false);
+    }
+
+    /// Begin a pass without rebinding an already bound DRAW framebuffer.
+    ///
+    /// # Safety
+    /// The caller owns the attachment's observation boundaries. When DRAW is
+    /// already this target, READ is left untouched; framebuffer-fetch/implicit
+    /// multisample state is not forced through a redundant BindFramebuffer.
+    pub unsafe fn begin_pass_avoiding_redundant_bind(&mut self, pass: impl Into<Option<RenderPass>>, action: PassAction) {
+        self.begin_pass_inner(pass.into(), action, true);
+    }
+
+    fn begin_pass_inner(&mut self, pass: Option<RenderPass>, action: PassAction, avoid_rebind: bool) {
+        let (framebuffer, w, h) = match pass {
             None => {
                 let (screen_width, screen_height) = self.screen_size();
                 (
@@ -1096,7 +1133,9 @@ impl GraphicsContext {
             }
         };
         unsafe {
-            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            let mut bound = -1;
+            if avoid_rebind { glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut bound); }
+            if bound as GLuint != framebuffer { glBindFramebuffer(GL_FRAMEBUFFER, framebuffer); }
             glViewport(0, 0, w, h);
             glScissor(0, 0, w, h);
         }
@@ -1115,9 +1154,17 @@ impl GraphicsContext {
     pub fn end_render_pass(&mut self) {
         unsafe {
             glBindFramebuffer(GL_FRAMEBUFFER, self.default_framebuffer);
-            self.cache.bind_buffer(GL_ARRAY_BUFFER, 0, None);
-            self.cache.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, 0, None);
         }
+        self.end_render_pass_preserving_framebuffer();
+    }
+
+    /// Release buffer bindings while retaining the framebuffer attachment.
+    /// An explicit offscreen attachment owner can continue rendering or resolve
+    /// it without switching through the window framebuffer. Buffer deletion and
+    /// recreation after this boundary have the same cache contract as end_pass.
+    pub fn end_render_pass_preserving_framebuffer(&mut self) {
+        self.cache.bind_buffer(GL_ARRAY_BUFFER, 0, None);
+        self.cache.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, 0, None);
     }
 
     pub fn commit_frame(&mut self) {
@@ -1845,6 +1892,30 @@ impl Buffer {
         ctx.cache
             .bind_buffer(gl_target, self.gl_buf, self.index_type);
         unsafe { glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _) };
+        ctx.cache.restore_buffer_binding(gl_target);
+    }
+
+    /// Replace all buffer contents without preserving the previous data store.
+    ///
+    /// Use for streaming complete batches. Orphaning permits the driver to keep
+    /// the old storage alive for queued draws instead of waiting for them. The
+    /// object name and bindings stay valid; untouched bytes are undefined.
+    /// Drivers may still synchronize or allocate, so benchmark on the device.
+    pub fn update_orphaned<T>(&self, ctx: &mut Context, data: &[T]) {
+        if self.buffer_type == BufferType::IndexBuffer {
+            assert_eq!(self.index_type, Some(IndexType::for_type::<T>()));
+        }
+        let size = mem::size_of_val(data);
+        assert!(size <= self.size);
+        let gl_target = gl_buffer_target(&self.buffer_type);
+        ctx.cache.store_buffer_binding(gl_target);
+        ctx.cache.bind_buffer(gl_target, self.gl_buf, self.index_type);
+        unsafe {
+            glBufferData(gl_target, self.size as _, std::ptr::null(), GL_STREAM_DRAW);
+            if size != 0 {
+                glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _);
+            }
+        }
         ctx.cache.restore_buffer_binding(gl_target);
     }
 
