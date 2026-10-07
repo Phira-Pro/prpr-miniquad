@@ -1,7 +1,9 @@
-use std::{ffi::CString, mem};
+use std::{convert::TryFrom, ffi::CString, mem};
 
 mod texture;
 mod capabilities;
+mod uniform_cache;
+pub use uniform_cache::UniformUploadStats;
 
 use crate::{native::gl::*, Context};
 
@@ -325,12 +327,14 @@ pub struct ShaderUniform {
     _size: usize,
     uniform_type: UniformType,
     array_count: i32,
+    value: uniform_cache::Value,
 }
 
 struct ShaderInternal {
     program: GLuint,
     images: Vec<ShaderImage>,
     uniforms: Vec<ShaderUniform>,
+    uniform_cache_eligible: bool,
 }
 
 /// Pixel arithmetic description for blending operations.
@@ -669,6 +673,8 @@ pub struct GraphicsContext {
     passes: Vec<RenderPassInternal>,
     default_framebuffer: GLuint,
     framebuffer_blit: bool,
+    uniform_cache_enabled: bool,
+    uniform_uploads: UniformUploadStats,
     cache: GlCache,
 
     pub(crate) features: Features,
@@ -690,6 +696,8 @@ impl GraphicsContext {
             GraphicsContext {
                 default_framebuffer,
                 framebuffer_blit: capabilities::framebuffer_blit(),
+                uniform_cache_enabled: false,
+                uniform_uploads: UniformUploadStats::default(),
                 shaders: vec![],
                 pipelines: vec![],
                 passes: vec![],
@@ -997,6 +1005,31 @@ impl GraphicsContext {
         }
     }
 
+    /// Enable exact per-program uniform reuse. Disabled on a new context.
+    /// GLES2 uniform lifetime rules suffice; no extension or format change.
+    ///
+    /// # Safety
+    /// While enabled, managed shader uniforms must be written through this
+    /// context. After raw GL writes invalidate before applying uniforms again.
+    /// A raw program relink also requires rebuilt Shader location metadata.
+    pub unsafe fn set_uniform_cache_enabled(&mut self, enabled: bool) {
+        self.invalidate_uniform_cache();
+        self.uniform_cache_enabled = enabled;
+    }
+
+    /// Forget cached values without clearing actual program state or waiting.
+    pub fn invalidate_uniform_cache(&mut self) {
+        for shader in &mut self.shaders {
+            for uniform in &mut shader.uniforms { uniform.value.invalidate(); }
+        }
+    }
+
+    pub fn uniform_upload_stats(&self) -> UniformUploadStats {
+        let mut stats = self.uniform_uploads;
+        stats.enabled = self.uniform_cache_enabled;
+        stats
+    }
+
     pub fn apply_uniforms<U>(&mut self, uniforms: &U) {
         self.apply_uniforms_from_bytes(uniforms as *const _ as *const u8, std::mem::size_of::<U>())
     }
@@ -1006,23 +1039,32 @@ impl GraphicsContext {
     /// Hidden because `apply_uniforms` is the recommended and safer way to work with uniforms.
     pub fn apply_uniforms_from_bytes(&mut self, uniform_ptr: *const u8, size: usize) {
         let pip = &self.pipelines[self.cache.cur_pipeline.unwrap().0];
-        let shader = &self.shaders[pip.shader.0];
+        let shader = &mut self.shaders[pip.shader.0];
 
-        let mut offset = 0;
-
-        for (_, uniform) in shader.uniforms.iter().enumerate() {
+        let eligible = self.uniform_cache_enabled && shader.uniform_cache_eligible;
+        for uniform in &mut shader.uniforms {
             use UniformType::*;
 
-            assert!(
-                offset <= size - uniform.uniform_type.size() / 4,
-                "Uniforms struct does not match shader uniforms layout"
-            );
-
+            let count = usize::try_from(uniform.array_count).expect("Uniform count exceeds GLsizei");
+            let range = uniform_cache::byte_range(uniform._offset, uniform._size, count, size)
+                .expect("Uniforms struct does not match full shader array layout");
             unsafe {
-                let data = (uniform_ptr as *const f32).offset(offset as isize);
-                let data_int = (uniform_ptr as *const i32).offset(offset as isize);
-
+                let data = uniform_ptr.add(range.start) as *const f32;
+                let data_int = uniform_ptr.add(range.start) as *const i32;
                 if let Some(gl_loc) = uniform.gl_loc {
+                    let bytes = std::slice::from_raw_parts(uniform_ptr.add(range.start), range.len());
+                    let had_storage = uniform.value.storage_len() == bytes.len();
+                    let within_budget = had_storage || self.uniform_uploads.cached_bytes
+                        .checked_add(bytes.len()).map_or(false, |n| n <= 4 * 1024 * 1024);
+                    let cache_this = eligible && within_budget;
+                    if cache_this && uniform.value.matches(bytes) {
+                        self.uniform_uploads.skipped_calls += 1;
+                        self.uniform_uploads.skipped_bytes += bytes.len() as u64;
+                        continue;
+                    }
+                    self.uniform_uploads.issued_calls += 1;
+                    self.uniform_uploads.issued_bytes += bytes.len() as u64;
+                    if self.uniform_cache_enabled && !cache_this { self.uniform_uploads.uncached_fields += 1; }
                     match uniform.uniform_type {
                         Float1 => {
                             glUniform1fv(gl_loc, uniform.array_count, data);
@@ -1052,9 +1094,12 @@ impl GraphicsContext {
                             glUniformMatrix4fv(gl_loc, uniform.array_count, 0, data);
                         }
                     }
+                    if cache_this {
+                        if !had_storage { self.uniform_uploads.cached_bytes += bytes.len(); }
+                        uniform.value.remember(bytes);
+                    }
                 }
             }
-            offset += uniform.uniform_type.size() / 4 * uniform.array_count as usize;
         }
     }
 
@@ -1265,15 +1310,21 @@ fn load_shader_internal(
                 _size: uniform.uniform_type.size(),
                 uniform_type: uniform.uniform_type,
                 array_count: uniform.array_count as _,
+                value: uniform_cache::Value::default(),
             };
             *offset += uniform.uniform_type.size() * uniform.array_count;
             Some(res)
         }).collect();
 
+        let uniform_cache_eligible = uniform_cache::names_disjoint(
+            meta.uniforms.uniforms.iter().map(|u| u.name.as_str()),
+            meta.images.iter().map(String::as_str),
+        );
         Ok(ShaderInternal {
             program,
             images,
             uniforms,
+            uniform_cache_eligible,
         })
     }
 }
