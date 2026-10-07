@@ -1346,6 +1346,12 @@ fn load_shader_internal(
     fragment_shader: &str,
     meta: ShaderMeta,
 ) -> Result<ShaderInternal, ShaderError> {
+    // Metadata names must be checked before any GL object is allocated.
+    // get_uniform_location can then construct its CString without an unwind leak.
+    for name in meta.images.iter().map(String::as_str)
+        .chain(meta.uniforms.uniforms.iter().map(|uniform| uniform.name.as_str())) {
+        CString::new(name)?;
+    }
     unsafe {
         let vertex_shader = load_shader(GL_VERTEX_SHADER, vertex_shader)?;
         let fragment_shader = match load_shader(GL_FRAGMENT_SHADER, fragment_shader) {
