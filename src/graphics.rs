@@ -4,6 +4,8 @@ mod texture;
 mod capabilities;
 mod uniform_cache;
 pub use uniform_cache::UniformUploadStats;
+mod submit_diagnostics;
+pub use submit_diagnostics::{DrawSubmission, SubmissionStats};
 
 use crate::{native::gl::*, Context};
 
@@ -675,6 +677,7 @@ pub struct GraphicsContext {
     framebuffer_blit: bool,
     uniform_cache_enabled: bool,
     uniform_uploads: UniformUploadStats,
+    submissions: submit_diagnostics::Counter,
     cache: GlCache,
 
     pub(crate) features: Features,
@@ -698,6 +701,7 @@ impl GraphicsContext {
                 framebuffer_blit: capabilities::framebuffer_blit(),
                 uniform_cache_enabled: false,
                 uniform_uploads: UniformUploadStats::default(),
+                submissions: submit_diagnostics::Counter::default(),
                 shaders: vec![],
                 pipelines: vec![],
                 passes: vec![],
@@ -779,6 +783,7 @@ impl GraphicsContext {
 
         self.set_stencil(self.pipelines[pipeline.0].params.stencil_test);
         self.set_color_write(self.pipelines[pipeline.0].params.color_write);
+        self.submissions.pipeline();
     }
 
     pub fn set_cull_face(&mut self, cull_face: CullFace) {
@@ -1003,6 +1008,7 @@ impl GraphicsContext {
                 }
             }
         }
+        self.submissions.bindings();
     }
 
     /// Enable exact per-program uniform reuse. Disabled on a new context.
@@ -1023,6 +1029,17 @@ impl GraphicsContext {
             for uniform in &mut shader.uniforms { uniform.value.invalidate(); }
         }
     }
+
+    /// Optional diagnostic only, default disabled. This counts managed draw/pass
+    /// API boundaries and binds, not physical GPU passes. Raw GL/EGL is excluded.
+    /// The ordered draw trace is bounded to 128 calls per reset; overflow is reported.
+    pub fn set_submission_diagnostics(&mut self, enabled: bool, trace: bool) {
+        self.submissions.configure(enabled, trace);
+    }
+    pub fn submission_diagnostics_enabled(&self) -> bool { self.submissions.enabled() }
+    pub fn reset_submission_stats(&mut self) { self.submissions.reset(); }
+    pub fn submission_stats(&self) -> SubmissionStats { self.submissions.stats() }
+    pub fn submission_trace(&self) -> Vec<DrawSubmission> { self.submissions.trace() }
 
     pub fn uniform_upload_stats(&self) -> UniformUploadStats {
         let mut stats = self.uniform_uploads;
@@ -1177,13 +1194,16 @@ impl GraphicsContext {
                 )
             }
         };
+        let framebuffer_bound;
         unsafe {
             let mut bound = -1;
             if avoid_rebind { glGetIntegerv(GL_FRAMEBUFFER_BINDING, &mut bound); }
-            if bound as GLuint != framebuffer { glBindFramebuffer(GL_FRAMEBUFFER, framebuffer); }
+            framebuffer_bound = bound as GLuint != framebuffer;
+            if framebuffer_bound { glBindFramebuffer(GL_FRAMEBUFFER, framebuffer); }
             glViewport(0, 0, w, h);
             glScissor(0, 0, w, h);
         }
+        self.submissions.begin(framebuffer_bound);
         match action {
             PassAction::Nothing => {}
             PassAction::Clear {
@@ -1200,6 +1220,7 @@ impl GraphicsContext {
         unsafe {
             glBindFramebuffer(GL_FRAMEBUFFER, self.default_framebuffer);
         }
+        self.submissions.framebuffer_bind();
         self.end_render_pass_preserving_framebuffer();
     }
 
@@ -1208,6 +1229,7 @@ impl GraphicsContext {
     /// it without switching through the window framebuffer. Buffer deletion and
     /// recreation after this boundary have the same cache contract as end_pass.
     pub fn end_render_pass_preserving_framebuffer(&mut self) {
+        self.submissions.end();
         self.cache.bind_buffer(GL_ARRAY_BUFFER, 0, None);
         self.cache.bind_buffer(GL_ELEMENT_ARRAY_BUFFER, 0, None);
     }
@@ -1234,6 +1256,7 @@ impl GraphicsContext {
         if !self.features.instancing && num_instances != 1 {
             println!("Instanced rendering is not supported by the GPU");
             println!("Ignoring this draw call");
+            self.submissions.rejected();
             return;
         }
 
@@ -1258,6 +1281,15 @@ impl GraphicsContext {
                     (index_type.size() as i32 * base_element) as *mut _,
                 );
             }
+        }
+        if self.submissions.enabled() {
+            self.submissions.draw(DrawSubmission {
+                pipeline: self.cache.cur_pipeline.unwrap().0,
+                program: self.shaders[pip.shader.0].program,
+                cached_texture0: self.cache.textures[0],
+                base_element, elements: num_elements, instances: num_instances,
+                instanced_api: self.features.instancing,
+            });
         }
     }
 }
