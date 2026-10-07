@@ -779,6 +779,23 @@ impl GraphicsContext {
             shader_slots: self.shaders.slots_len(), pipeline_slots: self.pipelines.slots_len() }
     }
 
+    /// Call after consuming deferred commands and before deleting/reusing raw
+    /// buffers or textures. GL name reuse must not match obsolete cached VAO or
+    /// sampler bindings. Does not introduce a render-pass boundary or GPU wait.
+    pub fn clear_resource_bindings(&mut self) {
+        for (index, attribute) in self.cache.attributes.iter_mut().enumerate() {
+            if attribute.take().is_some() {
+                unsafe { glDisableVertexAttribArray(index as GLuint); }
+            }
+        }
+        self.cache.clear_buffer_bindings();
+        self.cache.clear_texture_bindings();
+        self.cache.stored_vertex_buffer = 0;
+        self.cache.stored_index_buffer = 0;
+        self.cache.stored_index_type = None;
+        self.cache.stored_texture = 0;
+    }
+
     /// Current-context API/entry support. Each copy must still validate its
     /// framebuffer completeness, sample counts and color conversion conditions.
     pub fn supports_framebuffer_blit(&self) -> bool {
