@@ -2,6 +2,8 @@ use std::{convert::TryFrom, ffi::CString, mem};
 
 mod texture;
 mod capabilities;
+mod resource_arena;
+use resource_arena::{Arena, Handle};
 mod uniform_cache;
 pub use uniform_cache::UniformUploadStats;
 mod submit_diagnostics;
@@ -300,7 +302,7 @@ impl Error for ShaderError {
 }
 
 #[derive(Clone, Debug, Copy)]
-pub struct Shader(usize);
+pub struct Shader(Handle);
 
 impl Shader {
     pub fn new(
@@ -310,8 +312,40 @@ impl Shader {
         meta: ShaderMeta,
     ) -> Result<Shader, ShaderError> {
         let shader = load_shader_internal(vertex_shader, fragment_shader, meta)?;
-        ctx.shaders.push(shader);
-        Ok(Shader(ctx.shaders.len() - 1))
+        Ok(Shader(ctx.shaders.insert(shader)))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShaderResourceStats {
+    pub shaders: usize,
+    pub pipelines: usize,
+    pub shader_slots: usize,
+    pub pipeline_slots: usize,
+}
+
+impl Shader {
+    /// Returns None for a retired handle or a handle from another context.
+    pub fn gl_internal_id(&self, ctx: &Context) -> Option<GLuint> {
+        ctx.shaders.get(self.0).map(|shader| shader.program)
+    }
+
+    /// Retire only after all caller-owned deferred commands have been consumed.
+    /// Refuses retirement while a managed pipeline references this shader.
+    /// Invalidates the current program/pipeline binding; apply a live pipeline
+    /// before subsequent direct draws. No GPU finish/wait is inserted.
+    pub fn delete(&self, ctx: &mut Context) -> bool {
+        if ctx.pipelines.iter().any(|pipeline| pipeline.shader.0 == self.0) { return false; }
+        let Some(shader) = ctx.shaders.remove(self.0) else { return false; };
+        let bytes: usize = shader.uniforms.iter().map(|uniform| uniform.value.storage_len()).sum();
+        ctx.uniform_uploads.cached_bytes = ctx.uniform_uploads.cached_bytes.saturating_sub(bytes);
+        ctx.cache.cur_pipeline = None;
+        unsafe {
+            glUseProgram(0);
+            glDeleteProgram(shader.program);
+            for object in shader.objects { glDeleteShader(object); }
+        }
+        true
     }
 }
 
@@ -334,6 +368,7 @@ pub struct ShaderUniform {
 
 struct ShaderInternal {
     program: GLuint,
+    objects: [GLuint; 2],
     images: Vec<ShaderImage>,
     uniforms: Vec<ShaderUniform>,
     uniform_cache_eligible: bool,
@@ -670,8 +705,9 @@ impl Features {
 }
 
 pub struct GraphicsContext {
-    shaders: Vec<ShaderInternal>,
-    pipelines: Vec<PipelineInternal>,
+    context_id: usize,
+    shaders: Arena<ShaderInternal>,
+    pipelines: Arena<PipelineInternal>,
     passes: Vec<RenderPassInternal>,
     default_framebuffer: GLuint,
     framebuffer_blit: bool,
@@ -702,8 +738,9 @@ impl GraphicsContext {
                 uniform_cache_enabled: false,
                 uniform_uploads: UniformUploadStats::default(),
                 submissions: submit_diagnostics::Counter::default(),
-                shaders: vec![],
-                pipelines: vec![],
+                context_id: resource_arena::unique_id(),
+                shaders: Arena::default(),
+                pipelines: Arena::default(),
                 passes: vec![],
                 features: Features::from_gles2(is_gles2),
                 cache: GlCache {
@@ -730,6 +767,16 @@ impl GraphicsContext {
 
     pub fn features(&self) -> &Features {
         &self.features
+    }
+
+    /// Identity of this managed context, not an EGL context-loss detector.
+    pub fn context_id(&self) -> usize { self.context_id }
+
+    /// Managed resource occupancy. GL may retire submitted work asynchronously;
+    /// these counts do not claim physical driver memory has been reclaimed.
+    pub fn shader_resource_stats(&self) -> ShaderResourceStats {
+        ShaderResourceStats { shaders: self.shaders.len(), pipelines: self.pipelines.len(),
+            shader_slots: self.shaders.slots_len(), pipeline_slots: self.pipelines.slots_len() }
     }
 
     /// Current-context API/entry support. Each copy must still validate its
@@ -1025,7 +1072,7 @@ impl GraphicsContext {
 
     /// Forget cached values without clearing actual program state or waiting.
     pub fn invalidate_uniform_cache(&mut self) {
-        for shader in &mut self.shaders {
+        for shader in self.shaders.iter_mut() {
             for uniform in &mut shader.uniforms { uniform.value.invalidate(); }
         }
     }
@@ -1284,7 +1331,7 @@ impl GraphicsContext {
         }
         if self.submissions.enabled() {
             self.submissions.draw(DrawSubmission {
-                pipeline: self.cache.cur_pipeline.unwrap().0,
+                pipeline: self.cache.cur_pipeline.unwrap().0.slot,
                 program: self.shaders[pip.shader.0].program,
                 cached_texture0: self.cache.textures[0],
                 base_element, elements: num_elements, instances: num_instances,
@@ -1301,7 +1348,10 @@ fn load_shader_internal(
 ) -> Result<ShaderInternal, ShaderError> {
     unsafe {
         let vertex_shader = load_shader(GL_VERTEX_SHADER, vertex_shader)?;
-        let fragment_shader = load_shader(GL_FRAGMENT_SHADER, fragment_shader)?;
+        let fragment_shader = match load_shader(GL_FRAGMENT_SHADER, fragment_shader) {
+            Ok(shader) => shader,
+            Err(error) => { glDeleteShader(vertex_shader); return Err(error); }
+        };
 
         let program = glCreateProgram();
         glAttachShader(program, vertex_shader);
@@ -1314,17 +1364,18 @@ fn load_shader_internal(
             let mut max_length: i32 = 0;
             glGetProgramiv(program, GL_INFO_LOG_LENGTH, &mut max_length as *mut _);
 
-            let mut error_message = vec![0u8; max_length as usize + 1];
+            let mut error_message = vec![0u8; max_length.max(0) as usize + 1];
             glGetProgramInfoLog(
                 program,
                 max_length,
                 &mut max_length as *mut _,
                 error_message.as_mut_ptr() as *mut _,
             );
-            assert!(max_length >= 1);
-            let error_message =
-                std::string::String::from_utf8_lossy(&error_message[0..max_length as usize - 1]);
-            return Err(ShaderError::LinkError(error_message.to_string()));
+            let used = (max_length.max(0) as usize).min(error_message.len());
+            let error_message = std::string::String::from_utf8_lossy(&error_message[..used])
+                .trim_end_matches('\0').to_owned();
+            glDeleteProgram(program); glDeleteShader(vertex_shader); glDeleteShader(fragment_shader);
+            return Err(ShaderError::LinkError(error_message));
         }
 
         glUseProgram(program);
@@ -1354,6 +1405,7 @@ fn load_shader_internal(
         );
         Ok(ShaderInternal {
             program,
+            objects: [vertex_shader, fragment_shader],
             images,
             uniforms,
             uniform_cache_eligible,
@@ -1363,10 +1415,10 @@ fn load_shader_internal(
 
 pub fn load_shader(shader_type: GLenum, source: &str) -> Result<GLuint, ShaderError> {
     unsafe {
+        // Reject a malformed CString before allocating a GL object.
+        let cstring = CString::new(source)?;
         let shader = glCreateShader(shader_type);
         assert!(shader != 0);
-
-        let cstring = CString::new(source)?;
         let csource = [cstring];
         glShaderSource(shader, 1, csource.as_ptr() as *const _, std::ptr::null());
         glCompileShader(shader);
@@ -1377,7 +1429,7 @@ pub fn load_shader(shader_type: GLenum, source: &str) -> Result<GLuint, ShaderEr
             let mut max_length: i32 = 0;
             glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &mut max_length as *mut _);
 
-            let mut error_message = vec![0u8; max_length as usize + 1];
+            let mut error_message = vec![0u8; max_length.max(0) as usize + 1];
             glGetShaderInfoLog(
                 shader,
                 max_length,
@@ -1385,16 +1437,15 @@ pub fn load_shader(shader_type: GLenum, source: &str) -> Result<GLuint, ShaderEr
                 error_message.as_mut_ptr() as *mut _,
             );
 
-            assert!(max_length >= 1);
-            let mut error_message =
-                std::string::String::from_utf8_lossy(&error_message[0..max_length as usize - 1])
-                    .into_owned();
+            let used = (max_length.max(0) as usize).min(error_message.len());
+            let mut error_message = std::string::String::from_utf8_lossy(&error_message[..used]).into_owned();
 
             // On Wasm + Chrome, for unknown reason, string with zero-terminator is returned. On Firefox there is no zero-terminators in JavaScript string.
             if error_message.ends_with('\0') {
                 error_message.pop();
             }
 
+            glDeleteShader(shader);
             return Err(ShaderError::CompilationError {
                 shader_type: match shader_type {
                     GL_VERTEX_SHADER => ShaderType::Vertex,
@@ -1650,7 +1701,7 @@ pub struct PipelineParams {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct Pipeline(usize);
+pub struct Pipeline(Handle);
 
 impl Default for PipelineParams {
     fn default() -> PipelineParams {
@@ -1786,8 +1837,18 @@ impl Pipeline {
             params,
         };
 
-        ctx.pipelines.push(pipeline);
-        Pipeline(ctx.pipelines.len() - 1)
+        Pipeline(ctx.pipelines.insert(pipeline))
+    }
+
+    /// Consume caller-owned deferred commands before retiring their pipeline.
+    /// Old handles cannot alias a reused slot. Returns false if already retired
+    /// or if this handle belongs to another managed context.
+    pub fn delete(&self, ctx: &mut Context) -> bool {
+        if ctx.pipelines.remove(self.0).is_none() { return false; }
+        if ctx.cache.cur_pipeline.map(|pipeline| pipeline.0) == Some(self.0) {
+            ctx.cache.cur_pipeline = None;
+        }
+        true
     }
 
     pub fn set_blend(&self, ctx: &mut Context, color_blend: Option<BlendState>) {
