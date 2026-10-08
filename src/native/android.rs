@@ -346,16 +346,25 @@ impl MainThreadState {
     }
 
     fn frame(&mut self) {
+        let update_timing = crate::native_loop_timing::begin_phase(crate::native_loop_timing::Phase::Update);
         self.event_handler
             .update(self.context.with_display(&mut self.display));
+        crate::native_loop_timing::end_phase(update_timing);
 
         if self.surface.is_null() == false {
+            let draw_timing = crate::native_loop_timing::begin_phase(crate::native_loop_timing::Phase::Draw);
             self.event_handler
                 .draw(self.context.with_display(&mut self.display));
+            crate::native_loop_timing::end_phase(draw_timing);
 
+            let swap_timing = crate::native_loop_timing::begin_phase(crate::native_loop_timing::Phase::Swap);
             unsafe {
                 (self.libegl.eglSwapBuffers.unwrap())(self.egl_display, self.surface);
             }
+            crate::native_loop_timing::end_phase(swap_timing);
+        } else {
+            crate::native_loop_timing::skip_phase(crate::native_loop_timing::Phase::Draw);
+            crate::native_loop_timing::skip_phase(crate::native_loop_timing::Phase::Swap);
         }
     }
 }
@@ -491,14 +500,21 @@ where
         };
 
         while !s.quit {
+            let frame_timing = crate::native_loop_timing::begin_frame();
+            let events_timing = crate::native_loop_timing::begin_phase(crate::native_loop_timing::Phase::Events);
             // process all the messages from the main thread
             while let Ok(msg) = rx.try_recv() {
+                crate::native_loop_timing::event_message();
                 s.process_message(msg);
             }
+            crate::native_loop_timing::end_phase(events_timing);
 
             s.frame();
 
+            let yield_timing = crate::native_loop_timing::begin_phase(crate::native_loop_timing::Phase::Yield);
             thread::yield_now();
+            crate::native_loop_timing::end_phase(yield_timing);
+            crate::native_loop_timing::finish_frame(frame_timing);
         }
 
         (s.libegl.eglMakeCurrent.unwrap())(

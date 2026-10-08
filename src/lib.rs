@@ -4,6 +4,7 @@ pub mod fs;
 pub mod graphics;
 
 pub mod native;
+pub mod native_loop_timing;
 
 #[cfg(target_env = "ohos")]
 use napi_derive_ohos::napi;
