@@ -2,7 +2,7 @@ use std::{convert::TryFrom, ffi::CString, mem};
 
 mod texture;
 mod pixel_unpack;
-pub use pixel_unpack::{PixelUnpackBuffer, PixelUnpackError, PixelUnpackSession, MAX_PIXEL_UNPACK_CAPACITY};
+pub use pixel_unpack::{with_client_memory_unpack, PixelUnpackBuffer, PixelUnpackError, PixelUnpackSession, MAX_PIXEL_UNPACK_CAPACITY};
 mod capabilities;
 mod resource_arena;
 use resource_arena::{Arena, Handle};

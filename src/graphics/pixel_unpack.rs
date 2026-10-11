@@ -40,6 +40,10 @@ pub enum PixelUnpackError {
     ForeignThread,
     InvalidTexture,
     IncompleteTransfer,
+    ClientMemoryBindingMismatch {
+        actual: i32,
+        cleanup_code: Option<u32>,
+    },
     BufferNameZero {
         cleanup_code: Option<u32>,
     },
@@ -371,6 +375,80 @@ impl SavedUnpack {
     }
 }
 
+/// Runs existing client-pointer APIs with unpack-buffer zero and tight RGBA rows.
+/// Requires actual core ES3 and callable unpack entries; unsupported APIs decline.
+/// The closure must use the supplied context. Captured external unpack state is
+/// restored exactly, including a nonzero buffer. Operation/restore errors return
+/// Err; callers creating GL owners must retain their handles for error cleanup.
+/// Panic restores state through RAII and leaves GL errors for the caller.
+#[rustfmt::skip]
+pub fn with_client_memory_unpack<T>(
+    ctx: &mut Context, operation: impl FnOnce(&mut Context) -> T,
+) -> Result<T, PixelUnpackError> {
+    #[cfg(any(target_arch = "wasm32", target_os = "macos", target_os = "ios"))]
+    let loaded = false;
+    #[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios")))]
+    let loaded = ["glGetString", "glGetError", "glGetIntegerv", "glBindBuffer", "glPixelStorei"]
+        .iter().all(|name| crate::native::gl::is_function_loaded(name));
+    if !loaded { return Err(PixelUnpackError::Unsupported("Missing ES3 client-unpack entries")); }
+    unsafe {
+        let prior = glGetError();
+        if prior != 0 { return Err(gl_error("preexisting client memory error", prior)); }
+        let version = glGetString(GL_VERSION);
+        let error = glGetError();
+        if error != 0 { return Err(gl_error("client memory version query", error)); }
+        if version.is_null() || !guards::es3_version(CStr::from_ptr(version as _).to_bytes()) {
+            return Err(PixelUnpackError::Unsupported("Active API is not OpenGL ES 3+"));
+        }
+    }
+    let saved = unsafe {
+        let saved = SavedUnpack::capture();
+        let error = glGetError();
+        if error != 0 { return Err(gl_error("client memory state capture", error)); }
+        saved
+    };
+    // This local guard owns the exclusive context borrow until exact restore.
+    struct Restore<'a>(&'a mut Context, SavedUnpack, usize);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            if self.0.context_id() == self.2 { unsafe { self.1.restore(); } }
+        }
+    }
+    let context = ctx.context_id();
+    let scope = Restore(ctx, saved, context);
+    unsafe {
+        glBindBuffer(PIXEL_UNPACK_BUFFER, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(UNPACK_SKIP_ROWS, 0);
+        glPixelStorei(UNPACK_SKIP_PIXELS, 0);
+        let mut actual = -1;
+        glGetIntegerv(PIXEL_UNPACK_BUFFER_BINDING, &mut actual);
+        let error = glGetError();
+        if error != 0 || actual != 0 {
+            drop(scope);
+            let cleanup_code = match glGetError() { 0 => None, code => Some(code) };
+            return Err(if error != 0 {
+                PixelUnpackError::Gl { stage: "client memory state setup", code: error, cleanup_code }
+            } else {
+                PixelUnpackError::ClientMemoryBindingMismatch { actual, cleanup_code }
+            });
+        }
+    }
+    let value = operation(&mut *scope.0);
+    if scope.0.context_id() != context { return Err(PixelUnpackError::ForeignContext); }
+    let operation_error = unsafe { glGetError() };
+    drop(scope);
+    let restore_error = unsafe { glGetError() };
+    if operation_error != 0 {
+        return Err(PixelUnpackError::Gl {
+            stage: "client memory operation", code: operation_error,
+            cleanup_code: if restore_error == 0 { None } else { Some(restore_error) },
+        });
+    }
+    if restore_error != 0 { return Err(gl_error("client memory state restore", restore_error)); }
+    Ok(value)
+}
 /// One publication; holds exclusive context and PBO borrows until restoration.
 pub struct PixelUnpackSession<'a> {
     ctx: &'a mut Context,
