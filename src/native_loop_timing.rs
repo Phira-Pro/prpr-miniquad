@@ -9,6 +9,7 @@ use std::{
 };
 
 pub const CAPACITY: usize = 2048;
+pub const MAX_CAPACITY: usize = 32768;
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
@@ -110,15 +111,29 @@ struct Pending {
     cpu_valid: bool,
     valid: bool,
 }
-#[derive(Default)]
 struct Journal {
     epoch: u64,
     sequence: u64,
     pending: Option<Pending>,
     frames: VecDeque<Frame>,
+    capacity: usize,
     dropped: u64,
     discarded: u64,
     overflowed: bool,
+}
+impl Default for Journal {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            sequence: 0,
+            pending: None,
+            frames: VecDeque::new(),
+            capacity: CAPACITY,
+            dropped: 0,
+            discarded: 0,
+            overflowed: false,
+        }
+    }
 }
 impl Journal {
     fn reset(&mut self, epoch: u64) {
@@ -138,7 +153,7 @@ impl Journal {
     fn begin(&mut self, now: Point) -> Option<Token> {
         if let Some(previous) = self.pending.take() {
             if let Some(frame) = Self::finalize(previous, now) {
-                if self.frames.len() == CAPACITY {
+                if self.frames.len() == self.capacity {
                     self.frames.pop_front();
                     self.dropped = self.dropped.saturating_add(1);
                 }
@@ -342,7 +357,7 @@ impl State {
             wall_reads: self.wall_reads,
             origin_set: self.origin.is_some(),
             overflowed: self.journal.overflowed,
-            capacity: CAPACITY,
+            capacity: self.journal.capacity,
         }
     }
     fn accept_cpu(&mut self, value: Result<u64, String>) -> Option<u64> {
@@ -441,18 +456,42 @@ fn native_cpu(_: bool) -> Result<u64, String> {
 /// it is reported separately and is not included in later native samples or
 /// subtracted from any measured interval.
 pub fn configure(enabled: bool, cpu_mode: u8) -> Report {
-    ACTIVE.store(false, Ordering::Relaxed);
+    configure_with_capacity(enabled, cpu_mode, CAPACITY)
+        .expect("Failed to reserve default native-loop journal capacity")
+}
+
+/// Configures a bounded journal with a logical capacity in 1..=MAX_CAPACITY.
+/// An enabled capture reserves storage before resetting its epoch or changing
+/// any capture state. Invalid capacity or reservation failure leaves the
+/// previous capture unchanged. Completed frames never reserve on the hot path.
+pub fn configure_with_capacity(
+    enabled: bool,
+    cpu_mode: u8,
+    capacity: usize,
+) -> Result<Report, &'static str> {
+    if !(1..=MAX_CAPACITY).contains(&capacity) {
+        return Err("Native-loop journal capacity must be in 1..=32768");
+    }
     STATE.with(|slot| {
         let mut s = slot.borrow_mut();
+        if enabled && s.journal.frames.capacity() < capacity {
+            let additional = capacity - s.journal.frames.len();
+            s.journal
+                .frames
+                .try_reserve_exact(additional)
+                .map_err(|_| "Failed to reserve native-loop journal capacity")?;
+        }
+        ACTIVE.store(false, Ordering::Relaxed);
         let epoch = match s.journal.epoch.checked_add(1) {
             Some(epoch) => epoch,
             None => {
                 s.journal.overflowed = true;
                 s.enabled = false;
-                return s.report();
+                return Ok(s.report());
             }
         };
         s.journal.reset(epoch);
+        s.journal.capacity = capacity;
         s.enabled = enabled && !s.journal.overflowed;
         s.cpu_mode = cpu_mode;
         s.cpu_requested = enabled && cpu_mode != 0;
@@ -466,9 +505,6 @@ pub fn configure(enabled: bool, cpu_mode: u8) -> Report {
         s.last_cpu = None;
         s.origin = None;
         if s.enabled {
-            if s.journal.frames.capacity() < CAPACITY {
-                s.journal.frames.reserve(CAPACITY);
-            }
             match cpu_mode {
                 0 => {}
                 2 => s.cpu_error = Some("Forced missing thread CPU capability".into()),
@@ -517,7 +553,7 @@ pub fn configure(enabled: bool, cpu_mode: u8) -> Report {
             }
         }
         ACTIVE.store(s.enabled, Ordering::Relaxed);
-        s.report()
+        Ok(s.report())
     })
 }
 pub fn disable() {
@@ -814,6 +850,116 @@ mod tests {
         assert_eq!(s.report.cpu_reads, 0);
         disable();
     }
+    #[test]
+    fn invalid_capacity_preserves_active_capture_and_pending_frame() {
+        let _lock = API_TEST_LOCK.lock().unwrap();
+        let report = configure_with_capacity(true, 2, 4096).unwrap();
+        assert!(report.enabled && !report.cpu_enabled);
+        let token = begin_frame().unwrap();
+        let before = format!("{:?}", snapshot());
+        for (enabled, capacity) in [(true, 0), (false, MAX_CAPACITY + 1)] {
+            assert!(configure_with_capacity(enabled, 1, capacity).is_err());
+            assert_eq!(format!("{:?}", snapshot()), before);
+            assert!(ACTIVE.load(Ordering::Relaxed));
+            assert_eq!(current_frame_id(), Some(token.id));
+        }
+        disable();
+    }
+
+    #[test]
+    fn larger_capacity_keeps_first_segment_past_default_without_hot_reserve() {
+        let _lock = API_TEST_LOCK.lock().unwrap();
+        let report = configure_with_capacity(true, 0, 4096).unwrap();
+        assert_eq!(report.capacity, 4096);
+        STATE.with(|slot| {
+            let mut state = slot.borrow_mut();
+            let j = &mut state.journal;
+            let first_id = j.sequence + 1;
+            let reserved = j.frames.capacity();
+            assert!(reserved >= 4096);
+            for i in 0..3000 {
+                let token = j.begin(point(i * 200, None)).unwrap();
+                complete(j, token, false, false);
+            }
+            j.begin(point(3000 * 200, None)).unwrap();
+            assert_eq!(j.frames.len(), 3000);
+            assert_eq!(j.frames.front().unwrap().id, first_id);
+            assert_eq!(j.frames.back().unwrap().id, first_id + 2999);
+            assert_eq!(j.dropped, 0);
+            assert_eq!(j.frames.capacity(), reserved);
+        });
+        let captured = snapshot();
+        assert_eq!(captured.frames.len(), 3000);
+        assert_eq!(captured.report.capacity, 4096);
+        assert_eq!(captured.incomplete, 1);
+        disable();
+    }
+
+    #[test]
+    fn configured_bounds_roll_and_count_drops_without_hot_reserve() {
+        let _lock = API_TEST_LOCK.lock().unwrap();
+        for capacity in [1, 4096, MAX_CAPACITY] {
+            let report = configure_with_capacity(true, 2, capacity).unwrap();
+            assert_eq!(report.capacity, capacity);
+            assert!(report.enabled && !report.cpu_enabled);
+            assert_eq!(report.cpu_reads, 0);
+            STATE.with(|slot| {
+                let mut state = slot.borrow_mut();
+                let j = &mut state.journal;
+                let first_id = j.sequence + 1;
+                let reserved = j.frames.capacity();
+                assert!(reserved >= capacity);
+                for i in 0..capacity + 8 {
+                    let token = j.begin(point(i as u64 * 200, None)).unwrap();
+                    complete(j, token, false, false);
+                }
+                j.begin(point((capacity + 8) as u64 * 200, None)).unwrap();
+                assert_eq!(j.frames.len(), capacity);
+                assert_eq!(j.dropped, 8);
+                assert_eq!(j.frames.front().unwrap().id, first_id + 8);
+                assert_eq!(j.frames.back().unwrap().id, first_id + capacity as u64 + 7);
+                assert_eq!(j.frames.capacity(), reserved);
+            });
+            assert_eq!(snapshot().report.capacity, capacity);
+        }
+        disable();
+    }
+
+    #[test]
+    fn default_configure_restores_capacity_and_rejects_old_epoch() {
+        let _lock = API_TEST_LOCK.lock().unwrap();
+        let custom = configure_with_capacity(true, 0, 4096).unwrap();
+        let old = begin_frame().unwrap();
+        let report = configure(true, 2);
+        assert_eq!(report.capacity, CAPACITY);
+        assert_eq!(report.epoch, custom.epoch + 1);
+        assert!(report.enabled && !report.cpu_enabled);
+        assert_eq!(report.cpu_reads, 0);
+        finish_frame(Some(old));
+        let token = begin_frame().unwrap();
+        assert!(token.id > old.id);
+        for phase in [
+            Phase::Events,
+            Phase::Update,
+            Phase::Draw,
+            Phase::Swap,
+            Phase::Yield,
+        ] {
+            end_phase(begin_phase(phase));
+        }
+        finish_frame(Some(token));
+        begin_frame();
+        let captured = snapshot();
+        assert_eq!(captured.frames.len(), 1);
+        assert_eq!(captured.frames[0].id, token.id);
+        assert_eq!(captured.frames[0].epoch, report.epoch);
+        assert_eq!(captured.discarded, 1);
+        assert_eq!(captured.report.capacity, CAPACITY);
+        let disabled = configure(false, 0);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.capacity, CAPACITY);
+    }
+
     #[test]
     fn stamp_at_uses_existing_instant_and_own_native_begin_offset() {
         let _lock = API_TEST_LOCK.lock().unwrap();
