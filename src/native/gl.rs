@@ -413,6 +413,7 @@ gl_loader!(
         data: *const ::std::os::raw::c_void
     ) -> (),
     fn glGenBuffers(n: GLsizei, buffers: *mut GLuint) -> (),
+    fn glGetBufferParameteriv(target: GLenum, pname: GLenum, params: *mut GLint) -> (),
     fn glCheckFramebufferStatus(target: GLenum) -> GLenum,
     fn glFramebufferRenderbuffer(
         target: GLenum,
