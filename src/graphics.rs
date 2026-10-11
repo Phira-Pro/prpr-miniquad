@@ -1950,6 +1950,7 @@ pub struct Buffer {
     buffer_type: BufferType,
     size: usize,
     index_type: Option<IndexType>,
+    usage: Usage,
 }
 
 impl Buffer {
@@ -1994,6 +1995,7 @@ impl Buffer {
             buffer_type,
             size,
             index_type,
+            usage: Usage::Immutable,
         }
     }
 
@@ -2021,6 +2023,7 @@ impl Buffer {
             buffer_type,
             size,
             index_type,
+            usage: Usage::Stream,
         }
     }
 
@@ -2042,6 +2045,7 @@ impl Buffer {
             buffer_type: BufferType::IndexBuffer,
             size,
             index_type: Some(index_type),
+            usage: Usage::Stream,
         }
     }
     pub fn update<T>(&self, ctx: &mut Context, data: &[T]) {
@@ -2060,6 +2064,49 @@ impl Buffer {
             .bind_buffer(gl_target, self.gl_buf, self.index_type);
         unsafe { glBufferSubData(gl_target, 0, size as _, data.as_ptr() as *const _) };
         ctx.cache.restore_buffer_binding(gl_target);
+    }
+
+    fn discard_sizes<T>(&self, data: &[T]) -> Option<(GLsizeiptr, GLsizeiptr)> {
+        let size = mem::size_of_val(data);
+        if self.usage != Usage::Stream || self.gl_buf == 0 || size == 0 || size > self.size {
+            return None;
+        }
+        if self.buffer_type == BufferType::IndexBuffer
+            && self.index_type.map(|kind| kind.size() as usize) != Some(mem::size_of::<T>())
+        {
+            return None;
+        }
+        Some((
+            GLsizeiptr::try_from(self.size).ok()?,
+            GLsizeiptr::try_from(size).ok()?,
+        ))
+    }
+
+    /// Discard a stream buffer's previous storage and upload a complete batch.
+    ///
+    /// Only buffers created by `stream` or `index_stream` accept this operation.
+    /// Empty, oversized or incompatible index data returns `false` before any
+    /// binding or GL call. The fixed allocation size and buffer object name stay
+    /// unchanged; bytes after the uploaded batch become undefined. Call `update`
+    /// instead if any previous contents must be preserved.
+    ///
+    /// `true` means the input guards accepted the request, not that GL allocation
+    /// succeeded. Like `update`, this does not query GL errors or wait for the GPU.
+    /// The driver may still allocate or synchronize; device measurements are needed.
+    pub fn update_discard<T>(&self, ctx: &mut Context, data: &[T]) -> bool {
+        let (capacity, size) = match self.discard_sizes(data) {
+            Some(sizes) => sizes,
+            None => return false,
+        };
+        let gl_target = gl_buffer_target(&self.buffer_type);
+        ctx.cache.store_buffer_binding(gl_target);
+        ctx.cache.bind_buffer(gl_target, self.gl_buf, self.index_type);
+        unsafe {
+            glBufferData(gl_target, capacity, std::ptr::null(), GL_STREAM_DRAW);
+            glBufferSubData(gl_target, 0, size, data.as_ptr() as *const _);
+        }
+        ctx.cache.restore_buffer_binding(gl_target);
+        true
     }
 
     /// Replace all buffer contents without preserving the previous data store.
@@ -2100,6 +2147,82 @@ impl Buffer {
     /// this function is not marked as unsafe
     pub fn delete(&self) {
         unsafe { glDeleteBuffers(1, &self.gl_buf as *const _) }
+    }
+}
+
+#[cfg(test)]
+mod buffer_discard_tests {
+    use super::*;
+
+    fn buffer(buffer_type: BufferType, size: usize, index_type: Option<IndexType>) -> Buffer {
+        Buffer {
+            gl_buf: 17,
+            buffer_type,
+            size,
+            index_type,
+            usage: Usage::Stream,
+        }
+    }
+
+    #[test]
+    fn stream_metadata_and_fixed_capacity_survive_copy_and_clone() {
+        let original = buffer(BufferType::VertexBuffer, 32, None);
+        let copied = original;
+        let cloned = original.clone();
+        for candidate in [original, copied, cloned].iter() {
+            assert_eq!(candidate.gl_buf, 17);
+            assert_eq!(candidate.size(), 32);
+            assert_eq!(candidate.usage, Usage::Stream);
+            assert_eq!(candidate.discard_sizes(&[1_u8; 3]), Some((32, 3)));
+            assert_eq!(candidate.discard_sizes(&[1_u8; 32]), Some((32, 32)));
+        }
+        assert_eq!(original.gl_buf, 17);
+        assert_eq!(original.size(), 32);
+    }
+
+    #[test]
+    fn non_stream_empty_zero_sized_and_oversized_uploads_are_rejected() {
+        let mut candidate = buffer(BufferType::VertexBuffer, 8, None);
+        for usage in [Usage::Immutable, Usage::Dynamic].iter() {
+            candidate.usage = *usage;
+            assert_eq!(candidate.discard_sizes(&[1_u8]), None);
+        }
+        candidate.usage = Usage::Stream;
+        assert_eq!(candidate.discard_sizes::<u8>(&[]), None);
+        assert_eq!(candidate.discard_sizes(&[(); 4]), None);
+        assert_eq!(candidate.discard_sizes(&[1_u8; 9]), None);
+        candidate.size = 0;
+        assert_eq!(candidate.discard_sizes(&[1_u8]), None);
+        candidate.size = 8;
+        candidate.gl_buf = 0;
+        assert_eq!(candidate.discard_sizes(&[1_u8]), None);
+    }
+
+    #[test]
+    fn index_upload_width_matches_existing_index_type_without_panicking() {
+        let mut candidate = buffer(BufferType::IndexBuffer, 12, Some(IndexType::Byte));
+        assert_eq!(candidate.discard_sizes(&[1_u8; 12]), Some((12, 12)));
+        assert_eq!(candidate.discard_sizes(&[1_u16]), None);
+        candidate.index_type = Some(IndexType::Short);
+        assert_eq!(candidate.discard_sizes(&[1_u16; 6]), Some((12, 12)));
+        assert_eq!(candidate.discard_sizes(&[1_u32]), None);
+        candidate.index_type = Some(IndexType::Int);
+        assert_eq!(candidate.discard_sizes(&[1_u32; 3]), Some((12, 12)));
+        assert_eq!(candidate.discard_sizes(&[[0_u8; 3]; 1]), None);
+        assert_eq!(candidate.discard_sizes(&[1_u64]), None);
+        candidate.index_type = None;
+        assert_eq!(candidate.discard_sizes(&[1_u8]), None);
+    }
+
+    #[test]
+    fn allocation_capacity_must_fit_the_platform_gl_size_type() {
+        let maximum = GLsizeiptr::MAX as usize;
+        let mut candidate = buffer(BufferType::VertexBuffer, maximum, None);
+        assert_eq!(candidate.discard_sizes(&[1_u8]), Some((GLsizeiptr::MAX, 1)));
+        candidate.size = maximum + 1;
+        assert_eq!(candidate.discard_sizes(&[1_u8]), None);
+        candidate.size = usize::MAX;
+        assert_eq!(candidate.discard_sizes(&[1_u8]), None);
     }
 }
 
