@@ -401,53 +401,112 @@ pub fn with_client_memory_unpack<T>(
             return Err(PixelUnpackError::Unsupported("Active API is not OpenGL ES 3+"));
         }
     }
-    let saved = unsafe {
-        let saved = SavedUnpack::capture();
-        let error = glGetError();
-        if error != 0 { return Err(gl_error("client memory state capture", error)); }
-        saved
-    };
-    // This local guard owns the exclusive context borrow until exact restore.
-    struct Restore<'a>(&'a mut Context, SavedUnpack, usize);
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            if self.0.context_id() == self.2 { unsafe { self.1.restore(); } }
+    let mut scope = ClientMemoryUnpack::begin(ctx)?;
+    let value = operation(scope.context());
+    scope.finish()?;
+    Ok(value)
+}
+
+/// Internal transaction for APIs which already checked their own unpack capability.
+/// The public helper above retains its ES3-only gate.
+pub(super) struct ClientMemoryUnpack<'a> {
+    ctx: &'a mut Context,
+    saved: SavedUnpack,
+    context: usize,
+    restored: bool,
+}
+impl<'a> ClientMemoryUnpack<'a> {
+    pub(super) fn begin(ctx: &'a mut Context) -> Result<Self, PixelUnpackError> {
+        let saved = unsafe {
+            let saved = SavedUnpack::capture();
+            let error = glGetError();
+            if error != 0 {
+                return Err(gl_error("client memory state capture", error));
+            }
+            saved
+        };
+        let context = ctx.context_id();
+        let mut scope = Self {
+            ctx,
+            saved,
+            context,
+            restored: false,
+        };
+        unsafe {
+            glBindBuffer(PIXEL_UNPACK_BUFFER, 0);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glPixelStorei(UNPACK_ROW_LENGTH, 0);
+            glPixelStorei(UNPACK_SKIP_ROWS, 0);
+            glPixelStorei(UNPACK_SKIP_PIXELS, 0);
+            let mut actual = -1;
+            glGetIntegerv(PIXEL_UNPACK_BUFFER_BINDING, &mut actual);
+            let error = glGetError();
+            if error != 0 || actual != 0 {
+                scope.restore();
+                let cleanup_code = match glGetError() {
+                    0 => None,
+                    code => Some(code),
+                };
+                return Err(if error != 0 {
+                    PixelUnpackError::Gl {
+                        stage: "client memory state setup",
+                        code: error,
+                        cleanup_code,
+                    }
+                } else {
+                    PixelUnpackError::ClientMemoryBindingMismatch {
+                        actual,
+                        cleanup_code,
+                    }
+                });
+            }
         }
+        Ok(scope)
     }
-    let context = ctx.context_id();
-    let scope = Restore(ctx, saved, context);
-    unsafe {
-        glBindBuffer(PIXEL_UNPACK_BUFFER, 0);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glPixelStorei(UNPACK_ROW_LENGTH, 0);
-        glPixelStorei(UNPACK_SKIP_ROWS, 0);
-        glPixelStorei(UNPACK_SKIP_PIXELS, 0);
-        let mut actual = -1;
-        glGetIntegerv(PIXEL_UNPACK_BUFFER_BINDING, &mut actual);
-        let error = glGetError();
-        if error != 0 || actual != 0 {
-            drop(scope);
-            let cleanup_code = match glGetError() { 0 => None, code => Some(code) };
-            return Err(if error != 0 {
-                PixelUnpackError::Gl { stage: "client memory state setup", code: error, cleanup_code }
-            } else {
-                PixelUnpackError::ClientMemoryBindingMismatch { actual, cleanup_code }
+    pub(super) fn context(&mut self) -> &mut Context {
+        self.ctx
+    }
+    fn restore(&mut self) -> bool {
+        if self.restored {
+            return true;
+        }
+        self.restored = true;
+        if self.ctx.context_id() != self.context {
+            return false;
+        }
+        unsafe {
+            self.saved.restore();
+        }
+        true
+    }
+    pub(super) fn finish(mut self) -> Result<(), PixelUnpackError> {
+        if self.ctx.context_id() != self.context {
+            return Err(PixelUnpackError::ForeignContext);
+        }
+        let operation_error = unsafe { glGetError() };
+        self.restore();
+        let restore_error = unsafe { glGetError() };
+        if operation_error != 0 {
+            return Err(PixelUnpackError::Gl {
+                stage: "client memory operation",
+                code: operation_error,
+                cleanup_code: if restore_error == 0 {
+                    None
+                } else {
+                    Some(restore_error)
+                },
             });
         }
+        if restore_error != 0 {
+            return Err(gl_error("client memory state restore", restore_error));
+        }
+        Ok(())
     }
-    let value = operation(&mut *scope.0);
-    if scope.0.context_id() != context { return Err(PixelUnpackError::ForeignContext); }
-    let operation_error = unsafe { glGetError() };
-    drop(scope);
-    let restore_error = unsafe { glGetError() };
-    if operation_error != 0 {
-        return Err(PixelUnpackError::Gl {
-            stage: "client memory operation", code: operation_error,
-            cleanup_code: if restore_error == 0 { None } else { Some(restore_error) },
-        });
+}
+impl Drop for ClientMemoryUnpack<'_> {
+    fn drop(&mut self) {
+        self.restore();
     }
-    if restore_error != 0 { return Err(gl_error("client memory state restore", restore_error)); }
-    Ok(value)
 }
 /// One publication; holds exclusive context and PBO borrows until restoration.
 pub struct PixelUnpackSession<'a> {

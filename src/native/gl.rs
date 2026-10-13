@@ -622,6 +622,13 @@ gl_loader!(
     fn glBlendFunc(sfactor: GLenum, dfactor: GLenum) -> (),
     fn glReadBuffer(mode: GLenum) -> (),
     fn glClear(mask: GLbitfield) -> (),
+    fn glTexStorage2D(
+        target: GLenum,
+        levels: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei
+    ) -> (),
     fn glTexImage2D(
         target: GLenum,
         level: GLint,

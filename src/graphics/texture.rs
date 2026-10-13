@@ -144,6 +144,423 @@ pub struct TextureParams {
     pub height: u32,
 }
 
+/// A ready owner, or a refusal after which the original mutable constructor is safe.
+#[derive(Debug, PartialEq)]
+pub enum ImmutableTextureAttempt {
+    Ready(Texture),
+    Declined(ImmutableTextureDecline),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImmutableTextureDecline {
+    UnsupportedPlatform,
+    MissingEntryPoints,
+    UnsupportedApi,
+    NameZero,
+    Gl { stage: &'static str, code: u32 },
+}
+/// Fatal errors must not be silently retried through a legacy GL upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImmutableTextureFailure {
+    InvalidData {
+        width: u16,
+        height: u16,
+        bytes: usize,
+    },
+    InvalidMaximum(i32),
+    TextureTooLarge {
+        maximum: i32,
+    },
+    ForeignContext,
+    Gl {
+        stage: &'static str,
+        code: u32,
+    },
+    Unpack(crate::PixelUnpackError),
+    BindingRestore {
+        stage: &'static str,
+        code: u32,
+        active_restore_code: Option<u32>,
+    },
+    Creation(ImmutableTextureDecline),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImmutableTextureError {
+    pub failure: ImmutableTextureFailure,
+    pub unpack_cleanup: Option<crate::PixelUnpackError>,
+    pub binding_cleanup: Option<ImmutableTextureFailure>,
+    pub delete_code: Option<u32>,
+}
+impl ImmutableTextureError {
+    fn new(failure: ImmutableTextureFailure) -> Self {
+        Self {
+            failure,
+            unpack_cleanup: None,
+            binding_cleanup: None,
+            delete_code: None,
+        }
+    }
+    pub fn is_cleanup_failed(&self) -> bool {
+        let inner_unpack_cleanup = match &self.failure {
+            ImmutableTextureFailure::Unpack(
+                crate::PixelUnpackError::ClientMemoryBindingMismatch { cleanup_code, .. }
+                | crate::PixelUnpackError::BufferNameZero { cleanup_code }
+                | crate::PixelUnpackError::CapacityMismatch { cleanup_code, .. }
+                | crate::PixelUnpackError::Gl { cleanup_code, .. },
+            ) => cleanup_code.is_some(),
+            _ => false,
+        };
+        inner_unpack_cleanup
+            || self.unpack_cleanup.is_some()
+            || self.binding_cleanup.is_some()
+            || self.delete_code.is_some()
+    }
+}
+impl std::fmt::Display for ImmutableTextureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Immutable RGBA8 texture: {:?}; unpack cleanup: {:?}; binding cleanup: {:?}; delete: {:?}",
+            self.failure, self.unpack_cleanup, self.binding_cleanup, self.delete_code)
+    }
+}
+impl std::error::Error for ImmutableTextureError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImmutableApi {
+    Es,
+    Desktop,
+}
+fn immutable_api(version: &[u8]) -> Option<ImmutableApi> {
+    let (version, es) = match version.strip_prefix(b"OpenGL ES ") {
+        Some(version) => (version, true),
+        None => (version, false),
+    };
+    let dot = version.iter().position(|&byte| byte == b'.')?;
+    fn number(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() {
+            return None;
+        }
+        bytes.iter().try_fold(0u32, |value, &digit| {
+            if !digit.is_ascii_digit() {
+                return None;
+            }
+            value.checked_mul(10)?.checked_add((digit - b'0') as u32)
+        })
+    }
+    let major = number(&version[..dot])?;
+    let remaining = &version[dot + 1..];
+    let minor_end = remaining
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(remaining.len());
+    let minor = number(&remaining[..minor_end])?;
+    if remaining
+        .get(minor_end)
+        .is_some_and(|byte| *byte != b'.' && *byte != b' ')
+    {
+        return None;
+    }
+    if es && major >= 3 {
+        Some(ImmutableApi::Es)
+    } else if !es && (major > 4 || (major == 4 && minor >= 2)) {
+        Some(ImmutableApi::Desktop)
+    } else {
+        None
+    }
+}
+fn rgba8_input_valid(width: u16, height: u16, bytes: usize) -> bool {
+    width != 0
+        && height != 0
+        && (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|size| size.checked_mul(4))
+            == Some(bytes)
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        target_os = "windows",
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
+))]
+mod immutable {
+    use super::*;
+    use crate::graphics::pixel_unpack::ClientMemoryUnpack;
+    const ACTIVE_TEXTURE: GLenum = 0x84e0;
+    const TEXTURE_BINDING_2D: GLenum = 0x8069;
+    const CONTEXT_PROFILE_MASK: GLenum = 0x9126;
+    const CORE_PROFILE_BIT: GLint = 1;
+
+    fn gl_failure(stage: &'static str, code: u32) -> ImmutableTextureFailure {
+        ImmutableTextureFailure::Gl { stage, code }
+    }
+    fn creation_failure(stage: &'static str, code: u32) -> ImmutableTextureFailure {
+        // OOM leaves GL state undefined; context loss cannot safely use a fallback.
+        if code == 0x0505 || code == 0x0507 {
+            gl_failure(stage, code)
+        } else {
+            ImmutableTextureFailure::Creation(ImmutableTextureDecline::Gl { stage, code })
+        }
+    }
+    unsafe fn check(stage: &'static str) -> Result<(), ImmutableTextureFailure> {
+        match glGetError() {
+            0 => Ok(()),
+            code => Err(gl_failure(stage, code)),
+        }
+    }
+    unsafe fn check_creation(stage: &'static str) -> Result<(), ImmutableTextureFailure> {
+        match glGetError() {
+            0 => Ok(()),
+            code => Err(creation_failure(stage, code)),
+        }
+    }
+
+    /// This guard touches only unit zero, never the draw queue or another owner.
+    struct TextureBinding<'a> {
+        ctx: &'a mut Context,
+        context: usize,
+        active: GLint,
+        binding: GLuint,
+        restored: bool,
+    }
+    impl<'a> TextureBinding<'a> {
+        unsafe fn capture(ctx: &'a mut Context) -> Result<Self, ImmutableTextureError> {
+            let mut active = 0;
+            glGetIntegerv(ACTIVE_TEXTURE, &mut active);
+            check("active texture capture").map_err(ImmutableTextureError::new)?;
+            glActiveTexture(GL_TEXTURE0);
+            let mut binding = 0;
+            glGetIntegerv(TEXTURE_BINDING_2D, &mut binding);
+            if let Err(failure) = check("unit zero binding capture") {
+                glActiveTexture(active as GLenum);
+                let cleanup = check("capture active texture restore").err();
+                let mut error = ImmutableTextureError::new(failure);
+                error.binding_cleanup = cleanup;
+                return Err(error);
+            }
+            let context = ctx.context_id();
+            Ok(Self {
+                ctx,
+                context,
+                active,
+                binding: binding as GLuint,
+                restored: false,
+            })
+        }
+        fn restore(&mut self) -> Result<(), ImmutableTextureFailure> {
+            if self.restored {
+                return Ok(());
+            }
+            self.restored = true;
+            if self.ctx.context_id() != self.context {
+                return Err(ImmutableTextureFailure::ForeignContext);
+            }
+            unsafe {
+                glActiveTexture(GL_TEXTURE0);
+                let selection_error = glGetError();
+                let (stage, binding_error) = if selection_error != 0 {
+                    ("unit zero restore selection", selection_error)
+                } else {
+                    glBindTexture(GL_TEXTURE_2D, self.binding);
+                    let error = glGetError();
+                    if error == 0 {
+                        self.ctx.cache.textures[0] = self.binding;
+                    }
+                    ("unit zero binding restore", error)
+                };
+                glActiveTexture(self.active as GLenum);
+                let active_error = glGetError();
+                if binding_error != 0 {
+                    return Err(ImmutableTextureFailure::BindingRestore {
+                        stage,
+                        code: binding_error,
+                        active_restore_code: if active_error == 0 {
+                            None
+                        } else {
+                            Some(active_error)
+                        },
+                    });
+                }
+                if active_error != 0 {
+                    return Err(gl_failure("active texture restore", active_error));
+                }
+            }
+            Ok(())
+        }
+        fn finish(mut self) -> Result<(), ImmutableTextureFailure> {
+            self.restore()
+        }
+    }
+    impl Drop for TextureBinding<'_> {
+        fn drop(&mut self) {
+            let _ = self.restore();
+        }
+    }
+
+    pub(super) fn create(
+        ctx: &mut Context,
+        width: u16,
+        height: u16,
+        bytes: &[u8],
+    ) -> Result<ImmutableTextureAttempt, ImmutableTextureError> {
+        let loaded = [
+            "glGetString",
+            "glGetError",
+            "glGetIntegerv",
+            "glActiveTexture",
+            "glBindTexture",
+            "glGenTextures",
+            "glDeleteTextures",
+            "glTexStorage2D",
+            "glTexSubImage2D",
+            "glTexParameteri",
+            "glBindBuffer",
+            "glPixelStorei",
+        ]
+        .iter()
+        .all(|name| crate::native::gl::is_function_loaded(name));
+        if !loaded {
+            return Ok(ImmutableTextureAttempt::Declined(
+                ImmutableTextureDecline::MissingEntryPoints,
+            ));
+        }
+        unsafe {
+            check("preexisting immutable texture error").map_err(ImmutableTextureError::new)?;
+            let version = glGetString(GL_VERSION);
+            check("immutable version query").map_err(ImmutableTextureError::new)?;
+            let api = if version.is_null() {
+                None
+            } else {
+                immutable_api(std::ffi::CStr::from_ptr(version as _).to_bytes())
+            };
+            let Some(api) = api else {
+                return Ok(ImmutableTextureAttempt::Declined(
+                    ImmutableTextureDecline::UnsupportedApi,
+                ));
+            };
+            if api == ImmutableApi::Desktop {
+                let mut profile = 0;
+                glGetIntegerv(CONTEXT_PROFILE_MASK, &mut profile);
+                check("immutable desktop profile query").map_err(ImmutableTextureError::new)?;
+                if profile != CORE_PROFILE_BIT {
+                    return Ok(ImmutableTextureAttempt::Declined(
+                        ImmutableTextureDecline::UnsupportedApi,
+                    ));
+                }
+            }
+            let mut maximum = 0;
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &mut maximum);
+            check("immutable maximum size query").map_err(ImmutableTextureError::new)?;
+            if maximum <= 0 {
+                return Err(ImmutableTextureError::new(
+                    ImmutableTextureFailure::InvalidMaximum(maximum),
+                ));
+            }
+            if width as i32 > maximum || height as i32 > maximum {
+                return Err(ImmutableTextureError::new(
+                    ImmutableTextureFailure::TextureTooLarge { maximum },
+                ));
+            }
+        }
+        let binding = unsafe { TextureBinding::capture(ctx)? };
+        let (operation, unpack_cleanup, name) = {
+            match ClientMemoryUnpack::begin(&mut *binding.ctx) {
+                Err(failure) => (Err(ImmutableTextureFailure::Unpack(failure)), None, 0),
+                Ok(unpack) => {
+                    let mut name = 0;
+                    let operation = (|| unsafe {
+                        glGenTextures(1, &mut name);
+                        check_creation("immutable texture name")?;
+                        if name == 0 {
+                            return Err(ImmutableTextureFailure::Creation(
+                                ImmutableTextureDecline::NameZero,
+                            ));
+                        }
+                        glBindTexture(GL_TEXTURE_2D, name);
+                        check("immutable texture bind")?;
+                        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width as i32, height as i32);
+                        check_creation("immutable texture storage")?;
+                        glTexSubImage2D(
+                            GL_TEXTURE_2D,
+                            0,
+                            0,
+                            0,
+                            width as i32,
+                            height as i32,
+                            GL_RGBA,
+                            GL_UNSIGNED_BYTE,
+                            bytes.as_ptr().cast(),
+                        );
+                        check_creation("immutable full RGBA8 upload")?;
+                        for (parameter, value) in [
+                            (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+                            (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE),
+                            (GL_TEXTURE_MIN_FILTER, GL_LINEAR),
+                            (GL_TEXTURE_MAG_FILTER, GL_LINEAR),
+                        ] {
+                            glTexParameteri(GL_TEXTURE_2D, parameter, value as i32);
+                            check_creation("immutable texture parameters")?;
+                        }
+                        Ok(())
+                    })();
+                    let unpack_cleanup = unpack.finish().err();
+                    (operation, unpack_cleanup, name)
+                }
+            }
+        };
+        let foreign = matches!(
+            unpack_cleanup,
+            Some(crate::PixelUnpackError::ForeignContext)
+        );
+        let binding_cleanup = binding.finish().err();
+        if operation.is_ok() && unpack_cleanup.is_none() && binding_cleanup.is_none() {
+            return Ok(ImmutableTextureAttempt::Ready(Texture {
+                texture: name,
+                width: width as u32,
+                height: height as u32,
+                format: TextureFormat::RGBA8,
+            }));
+        }
+        let foreign = foreign
+            || matches!(
+                binding_cleanup,
+                Some(ImmutableTextureFailure::ForeignContext)
+            );
+        let delete_code = if name != 0 && !foreign {
+            unsafe {
+                glDeleteTextures(1, &name);
+                match glGetError() {
+                    0 => None,
+                    code => Some(code),
+                }
+            }
+        } else {
+            None
+        };
+        let failure = operation.err().unwrap_or_else(|| {
+            if foreign {
+                ImmutableTextureFailure::ForeignContext
+            } else if let Some(error) = unpack_cleanup.clone() {
+                ImmutableTextureFailure::Unpack(error)
+            } else {
+                binding_cleanup.clone().unwrap()
+            }
+        });
+        let error = ImmutableTextureError {
+            failure,
+            unpack_cleanup,
+            binding_cleanup,
+            delete_code,
+        };
+        if !error.is_cleanup_failed() {
+            if let ImmutableTextureFailure::Creation(reason) = error.failure {
+                return Ok(ImmutableTextureAttempt::Declined(reason));
+            }
+        }
+        Err(error)
+    }
+}
+
 impl Texture {
     /// Shorthand for `new(ctx, TextureAccess::RenderTarget, params)`
     pub fn new_render_texture(ctx: &mut Context, params: TextureParams) -> Texture {
@@ -225,6 +642,54 @@ impl Texture {
     /// Upload texture to GPU with given TextureParams
     pub fn from_data_and_format(ctx: &mut Context, bytes: &[u8], params: TextureParams) -> Texture {
         Self::new(ctx, TextureAccess::Static, Some(bytes), params)
+    }
+
+    /// Creates one initialized, fixed-size RGBA8 level using core immutable storage.
+    /// Keeps Linear/Clamp sampling and exact caller bytes. Updates remain legal;
+    /// resize is not legal for this texture. The returned owner still requires delete.
+    /// A Declined result permits the original mutable constructor; Err does not.
+    /// Unsupported platforms perform no GL calls. Requires the creating GL context
+    /// to be current on its render thread, as for the existing Texture constructors.
+    pub fn try_from_rgba8_immutable(
+        ctx: &mut Context,
+        width: u16,
+        height: u16,
+        bytes: &[u8],
+    ) -> Result<ImmutableTextureAttempt, ImmutableTextureError> {
+        if !rgba8_input_valid(width, height, bytes.len()) {
+            return Err(ImmutableTextureError::new(
+                ImmutableTextureFailure::InvalidData {
+                    width,
+                    height,
+                    bytes: bytes.len(),
+                },
+            ));
+        }
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(
+                target_os = "windows",
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "ohos"))
+            )
+        ))]
+        {
+            immutable::create(ctx, width, height, bytes)
+        }
+        #[cfg(not(all(
+            not(target_arch = "wasm32"),
+            any(
+                target_os = "windows",
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "ohos"))
+            )
+        )))]
+        {
+            let _ = ctx;
+            Ok(ImmutableTextureAttempt::Declined(
+                ImmutableTextureDecline::UnsupportedPlatform,
+            ))
+        }
     }
 
     /// Upload RGBA8 texture to GPU
@@ -389,3 +854,48 @@ impl Texture {
         self.format.size(width, height) as usize
     }
 }
+
+#[cfg(test)]
+mod immutable_guard_tests {
+    use super::*;
+    #[test]
+    fn core_storage_versions_are_exact_and_old_or_unknown_apis_decline() {
+        for version in [b"OpenGL ES 3.0 Vendor".as_slice(), b"OpenGL ES 3.2"] {
+            assert_eq!(immutable_api(version), Some(ImmutableApi::Es));
+        }
+        for version in [b"4.2 Vendor".as_slice(), b"4.6.0 Vendor"] {
+            assert_eq!(immutable_api(version), Some(ImmutableApi::Desktop));
+        }
+        for version in [
+            b"OpenGL ES 2.0".as_slice(),
+            b"4.1 Vendor",
+            b"WebGL 2.0",
+            b"",
+            b"OpenGL ES-CM 3.0",
+            b"OpenGL ES 3.",
+            b"4.2garbage",
+            b"42949672960.2",
+        ] {
+            assert_eq!(immutable_api(version), None);
+        }
+    }
+    #[test]
+    fn exact_nonempty_rgba_input_is_required_before_gl() {
+        assert!(rgba8_input_valid(2, 3, 24));
+        assert!(!rgba8_input_valid(0, 3, 0));
+        assert!(!rgba8_input_valid(2, 0, 0));
+        assert!(!rgba8_input_valid(2, 3, 23));
+        assert!(!rgba8_input_valid(2, 3, 25));
+    }
+}
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    any(
+        target_os = "windows",
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "ohos"))
+    )
+))]
+#[path = "texture_immutable_tests.rs"]
+mod immutable_transaction_tests;

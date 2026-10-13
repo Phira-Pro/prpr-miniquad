@@ -15,7 +15,7 @@ use crate::{native::gl::*, Context};
 
 use std::{error::Error, fmt::Display};
 
-pub use texture::{FilterMode, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap};
+pub use texture::{FilterMode, ImmutableTextureAttempt, ImmutableTextureDecline, ImmutableTextureError, ImmutableTextureFailure, Texture, TextureAccess, TextureFormat, TextureParams, TextureWrap};
 
 fn get_uniform_location(program: GLuint, name: &str) -> Option<i32> {
     let cname = CString::new(name).unwrap_or_else(|e| panic!("{}", e));
